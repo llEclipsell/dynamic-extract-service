@@ -1,227 +1,1148 @@
-import json
 import os
+import json
 import re
 from datetime import datetime
-
-import httpx
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from typing import Any, Dict
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from google import genai
+from google.genai import types
+
+
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="Dynamic Schema Structured Extraction API",
+    version="2.0.0"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-3.5-flash"
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+client = None
+
+if GEMINI_API_KEY:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
+class DynamicExtractRequest(BaseModel):
+
+    text: str
+
+    schema: Dict[str, str]
+
+
+# ============================================================
+# SUPPORTED TYPES
+# ============================================================
 
 SUPPORTED_TYPES = {
-    "string", "integer", "float", "boolean", "date",
-    "array[string]", "array[integer]",
+    "string",
+    "integer",
+    "float",
+    "boolean",
+    "date",
+    "array[string]",
+    "array[integer]"
 }
 
 
-def gemini_type_for(field_type: str) -> dict:
-    """Map a requested field type to a Gemini responseSchema fragment."""
-    if field_type == "string":
-        return {"type": "STRING", "nullable": True}
-    if field_type == "integer":
-        return {"type": "INTEGER", "nullable": True}
-    if field_type == "float":
-        return {"type": "NUMBER", "nullable": True}
-    if field_type == "boolean":
-        return {"type": "BOOLEAN", "nullable": True}
-    if field_type == "date":
-        return {"type": "STRING", "nullable": True, "description": "ISO format YYYY-MM-DD"}
-    if field_type == "array[string]":
-        return {"type": "ARRAY", "items": {"type": "STRING"}, "nullable": True}
-    if field_type == "array[integer]":
-        return {"type": "ARRAY", "items": {"type": "INTEGER"}, "nullable": True}
-    # Unknown type -> treat as string, safest default
-    return {"type": "STRING", "nullable": True}
+# ============================================================
+# FIELD NAME HELPERS
+# ============================================================
+
+def normalize_field_name(
+    field: str
+) -> str:
+
+    field = field.strip()
+
+    field = re.sub(
+        r"([a-z0-9])([A-Z])",
+        r"\1_\2",
+        field
+    )
+
+    field = field.replace(
+        "-",
+        "_"
+    )
+
+    field = re.sub(
+        r"\s+",
+        "_",
+        field
+    )
+
+    return field.lower()
 
 
-def build_response_schema(schema: Dict[str, str]) -> dict:
-    properties = {}
-    for key, ftype in schema.items():
-        properties[key] = gemini_type_for(ftype)
-    return {
-        "type": "OBJECT",
-        "properties": properties,
-        "required": list(schema.keys()),
-    }
+def humanize_field(
+    field: str
+) -> str:
+
+    field = normalize_field_name(
+        field
+    )
+
+    return field.replace(
+        "_",
+        " "
+    )
 
 
-DATE_FORMATS = [
-    "%Y-%m-%d", "%d %B %Y", "%B %d, %Y", "%B %d %Y", "%d %b %Y", "%b %d, %Y",
-    "%b %d %Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y",
-]
+# ============================================================
+# TYPE VALIDATION
+# ============================================================
+
+def validate_schema(
+    schema: Dict[str, str]
+):
+
+    if not isinstance(
+        schema,
+        dict
+    ):
+
+        raise ValueError(
+            "schema must be an object"
+        )
 
 
-def normalize_date(raw) -> Any:
-    if raw is None:
-        return None
-    raw = str(raw).strip()
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-        return raw
-    for fmt in DATE_FORMATS:
-        try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    # Last resort: try to pull YYYY, Month name/number, and Day out of the string
-    m = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", raw)
-    if m:
-        try:
-            return datetime.strptime(m.group(0), "%d %B %Y").strftime("%Y-%m-%d")
-        except ValueError:
-            try:
-                return datetime.strptime(m.group(0), "%d %b %Y").strftime("%Y-%m-%d")
-            except ValueError:
-                pass
-    return None
+    if not schema:
+
+        raise ValueError(
+            "schema must not be empty"
+        )
 
 
-def coerce_value(value: Any, field_type: str) -> Any:
-    if value is None:
-        return None
-    try:
-        if field_type == "string":
-            return str(value)
-        if field_type == "integer":
-            if isinstance(value, bool):
-                return None
-            return int(float(str(value).replace(",", "")))
-        if field_type == "float":
-            return float(str(value).replace(",", ""))
-        if field_type == "boolean":
-            if isinstance(value, bool):
-                return value
-            return str(value).strip().lower() in ("true", "1", "yes", "on")
-        if field_type == "date":
-            return normalize_date(value)
-        if field_type == "array[string]":
-            if isinstance(value, list):
-                return [str(v) for v in value]
-            return [str(value)]
-        if field_type == "array[integer]":
-            if isinstance(value, list):
-                return [int(float(str(v))) for v in value]
-            return [int(float(str(value)))]
-    except (ValueError, TypeError):
-        return None
-    return None
+    for field, field_type in schema.items():
 
+        if not isinstance(
+            field,
+            str
+        ) or not field.strip():
 
-def validate_and_coerce(raw: dict, schema: Dict[str, str]) -> dict:
-    """Return exactly the requested keys, correctly typed, no extras."""
-    result = {}
-    for key, ftype in schema.items():
-        val = raw.get(key) if isinstance(raw, dict) else None
-        result[key] = coerce_value(val, ftype)
-    return result
-
-
-# ---- Heuristic fallback (used only if the LLM call fails outright) ----
-
-def heuristic_fallback(text: str, schema: Dict[str, str]) -> dict:
-    result = {}
-    used_spans = []
-
-    def find_first_unused(pattern):
-        for m in re.finditer(pattern, text):
-            if not any(a <= m.start() < b for a, b in used_spans):
-                used_spans.append((m.start(), m.end()))
-                return m
-        return None
-
-    for key, ftype in schema.items():
-        val = None
-        if ftype == "integer":
-            m = find_first_unused(r"\b\d+\b")
-            if m:
-                val = int(m.group(0))
-        elif ftype == "float":
-            m = find_first_unused(r"\b\d[\d,]*\.\d+\b|\b\d[\d,]*\b")
-            if m:
-                val = float(m.group(0).replace(",", ""))
-        elif ftype == "date":
-            m = re.search(
-                r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\b|"
-                r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{4}\b",
-                text,
+            raise ValueError(
+                "schema contains invalid field name"
             )
-            if m:
-                val = normalize_date(m.group(0))
-        elif ftype == "boolean":
-            val = bool(re.search(r"\btrue\b|\byes\b", text, re.IGNORECASE))
-        elif ftype in ("array[string]", "array[integer]"):
-            val = None
-        else:
-            val = None
-        result[key] = val
+
+
+        if field_type not in SUPPORTED_TYPES:
+
+            raise ValueError(
+                f"Unsupported type: {field_type}"
+            )
+
+
+# ============================================================
+# DEFAULT VALUE
+# ============================================================
+
+def default_value(
+    field_type: str
+):
+
+    # All missing fields must be null.
+    return None
+
+
+# ============================================================
+# CONVERT VALUE TO REQUESTED TYPE
+# ============================================================
+
+def convert_value(
+    value: Any,
+    field_type: str
+):
+
+    if value is None:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # STRING
+    # --------------------------------------------------------
+
+    if field_type == "string":
+
+        if isinstance(
+            value,
+            bool
+        ):
+
+            return (
+                "true"
+                if value
+                else "false"
+            )
+
+
+        if isinstance(
+            value,
+            (dict, list)
+        ):
+
+            return json.dumps(
+                value,
+                ensure_ascii=False
+            )
+
+
+        return str(
+            value
+        ).strip()
+
+
+    # --------------------------------------------------------
+    # INTEGER
+    # --------------------------------------------------------
+
+    if field_type == "integer":
+
+        if isinstance(
+            value,
+            bool
+        ):
+
+            return None
+
+
+        if isinstance(
+            value,
+            int
+        ):
+
+            return value
+
+
+        if isinstance(
+            value,
+            float
+        ):
+
+            if value.is_integer():
+
+                return int(
+                    value
+                )
+
+            return None
+
+
+        s = str(
+            value
+        ).strip()
+
+
+        # Remove common numeric formatting
+        s = s.replace(
+            ",",
+            ""
+        )
+
+
+        # Handle currency
+        s = re.sub(
+            r"^[^\d+-]*",
+            "",
+            s
+        )
+
+
+        match = re.search(
+            r"[-+]?\d+",
+            s
+        )
+
+
+        if not match:
+
+            return None
+
+
+        try:
+
+            return int(
+                match.group(0)
+            )
+
+        except:
+
+            return None
+
+
+    # --------------------------------------------------------
+    # FLOAT
+    # --------------------------------------------------------
+
+    if field_type == "float":
+
+        if isinstance(
+            value,
+            bool
+        ):
+
+            return None
+
+
+        if isinstance(
+            value,
+            (int, float)
+        ):
+
+            return float(
+                value
+            )
+
+
+        s = str(
+            value
+        ).strip()
+
+
+        s = s.replace(
+            ",",
+            ""
+        )
+
+
+        # Find decimal or integer number
+        match = re.search(
+            r"[-+]?(?:\d+\.\d+|\d+)",
+            s
+        )
+
+
+        if not match:
+
+            return None
+
+
+        try:
+
+            return float(
+                match.group(0)
+            )
+
+        except:
+
+            return None
+
+
+    # --------------------------------------------------------
+    # BOOLEAN
+    # --------------------------------------------------------
+
+    if field_type == "boolean":
+
+        if isinstance(
+            value,
+            bool
+        ):
+
+            return value
+
+
+        s = str(
+            value
+        ).strip().lower()
+
+
+        if s in {
+            "true",
+            "yes",
+            "y",
+            "1",
+            "on"
+        }:
+
+            return True
+
+
+        if s in {
+            "false",
+            "no",
+            "n",
+            "0",
+            "off"
+        }:
+
+            return False
+
+
+        return None
+
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    if field_type == "date":
+
+        if isinstance(
+            value,
+            datetime
+        ):
+
+            return value.strftime(
+                "%Y-%m-%d"
+            )
+
+
+        s = str(
+            value
+        ).strip()
+
+
+        # Already ISO
+        match = re.fullmatch(
+            r"(\d{4})-(\d{2})-(\d{2})",
+            s
+        )
+
+
+        if match:
+
+            try:
+
+                datetime.strptime(
+                    s,
+                    "%Y-%m-%d"
+                )
+
+                return s
+
+            except:
+
+                return None
+
+
+        # DD Month YYYY
+        for fmt in [
+            "%d %B %Y",
+            "%d %b %Y",
+            "%B %d %Y",
+            "%b %d %Y"
+        ]:
+
+            try:
+
+                dt = datetime.strptime(
+                    s,
+                    fmt
+                )
+
+                return dt.strftime(
+                    "%Y-%m-%d"
+                )
+
+            except:
+
+                pass
+
+
+        # DD/MM/YYYY
+        for fmt in [
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d.%m.%Y"
+        ]:
+
+            try:
+
+                dt = datetime.strptime(
+                    s,
+                    fmt
+                )
+
+                return dt.strftime(
+                    "%Y-%m-%d"
+                )
+
+            except:
+
+                pass
+
+
+        return None
+
+
+    # --------------------------------------------------------
+    # ARRAY STRING
+    # --------------------------------------------------------
+
+    if field_type == "array[string]":
+
+        if isinstance(
+            value,
+            list
+        ):
+
+            result = []
+
+            for item in value:
+
+                if item is not None:
+
+                    result.append(
+                        str(item).strip()
+                    )
+
+
+            return result
+
+
+        if isinstance(
+            value,
+            str
+        ):
+
+            # Handle comma-separated values
+            return [
+                x.strip()
+                for x in value.split(",")
+                if x.strip()
+            ]
+
+
+        return None
+
+
+    # --------------------------------------------------------
+    # ARRAY INTEGER
+    # --------------------------------------------------------
+
+    if field_type == "array[integer]":
+
+        if isinstance(
+            value,
+            list
+        ):
+
+            result = []
+
+            for item in value:
+
+                converted = convert_value(
+                    item,
+                    "integer"
+                )
+
+                if converted is not None:
+
+                    result.append(
+                        converted
+                    )
+
+
+            return result
+
+
+        if isinstance(
+            value,
+            str
+        ):
+
+            numbers = re.findall(
+                r"[-+]?\d+",
+                value
+            )
+
+            return [
+                int(x)
+                for x in numbers
+            ]
+
+
+        return None
+
+
+    return None
+
+
+# ============================================================
+# LLM EXTRACTION
+# ============================================================
+
+def extract_with_llm(
+    text: str,
+    schema: Dict[str, str]
+) -> Dict[str, Any]:
+
+    if client is None:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured"
+        )
+
+
+    schema_json = json.dumps(
+        schema,
+        ensure_ascii=False,
+        indent=2
+    )
+
+
+    prompt = f"""
+You are a high-reliability information extraction system.
+
+Extract structured information from the TEXT below.
+
+TEXT:
+{text}
+
+REQUESTED SCHEMA:
+{schema_json}
+
+SUPPORTED TYPES:
+- string
+- integer
+- float
+- boolean
+- date
+- array[string]
+- array[integer]
+
+STRICT RULES:
+
+1. Return ONLY valid JSON.
+2. Return EXACTLY the requested field names.
+3. Never add fields that are not in the schema.
+4. Never omit a requested field.
+5. If a requested field cannot be determined from the text,
+   return null.
+6. Never use outside knowledge.
+7. Extract values only from the supplied text.
+8. Interpret field names semantically.
+
+Examples of semantic field names:
+
+- from_bank means the bank the money/payment was sent from.
+- to_bank means the bank the money/payment was sent to.
+- customer_name means the customer's name.
+- sender_name means the sender's name.
+- receiver_name means the receiver's name.
+- account_number means an account number.
+- transaction_id means a transaction identifier.
+- purchase_date means the date of purchase.
+- amount means the relevant monetary amount.
+- quantity means the relevant quantity.
+- store means the store or seller.
+- company means the relevant company.
+
+9. Pay close attention to relationships and direction.
+
+For example:
+
+"Transferred Rs. 5000 from HDFC to SBI"
+
+means:
+
+from_bank = "HDFC"
+to_bank = "SBI"
+
+Do NOT return null when the requested field can be inferred
+directly from the wording of the text.
+
+10. For date fields, return YYYY-MM-DD.
+11. For integer fields, return JSON integers.
+12. For float fields, return JSON numbers.
+13. For boolean fields, return true or false.
+14. For array[string], return a JSON array of strings.
+15. For array[integer], return a JSON array of integers.
+
+Return JSON only.
+"""
+
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            max_output_tokens=2000
+        )
+    )
+
+
+    if not response.text:
+
+        return {}
+
+
+    raw = response.text.strip()
+
+
+    try:
+
+        data = json.loads(
+            raw
+        )
+
+    except Exception:
+
+        # Try extracting JSON object
+        match = re.search(
+            r"\{.*\}",
+            raw,
+            re.DOTALL
+        )
+
+
+        if not match:
+
+            return {}
+
+
+        try:
+
+            data = json.loads(
+                match.group(0)
+            )
+
+        except:
+
+            return {}
+
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        return {}
+
+
+    return data
+
+
+# ============================================================
+# DETERMINISTIC FALLBACKS
+#
+# This specifically protects against cases where the LLM
+# misses obvious values in the text.
+# ============================================================
+
+def deterministic_extract(
+    text: str,
+    field: str,
+    field_type: str
+):
+
+    field_normalized = normalize_field_name(
+        field
+    )
+
+    lower = text.lower()
+
+
+    # ========================================================
+    # BANK RELATIONSHIPS
+    # ========================================================
+
+    if (
+        "bank" in field_normalized
+        and field_normalized.startswith(
+            "from_"
+        )
+    ):
+
+        # "from HDFC to SBI"
+        pattern = re.search(
+            r"\bfrom\s+([A-Za-z][A-Za-z0-9 .&_-]*?)"
+            r"\s+\bto\b",
+            text,
+            re.IGNORECASE
+        )
+
+
+        if pattern:
+
+            candidate = pattern.group(
+                1
+            ).strip()
+
+
+            # Avoid capturing excessive text
+            candidate = re.split(
+                r"\s+(?:for|on|at|with|using)\s+",
+                candidate,
+                flags=re.IGNORECASE
+            )[0].strip()
+
+
+            if candidate:
+
+                return convert_value(
+                    candidate,
+                    field_type
+                )
+
+
+    if (
+        "bank" in field_normalized
+        and field_normalized.startswith(
+            "to_"
+        )
+    ):
+
+        pattern = re.search(
+            r"\bto\s+([A-Za-z][A-Za-z0-9 .&_-]*?)"
+            r"(?:\s+(?:for|on|at|with|using)\b|[.,]|$)",
+            text,
+            re.IGNORECASE
+        )
+
+
+        if pattern:
+
+            candidate = pattern.group(
+                1
+            ).strip()
+
+
+            if candidate:
+
+                return convert_value(
+                    candidate,
+                    field_type
+                )
+
+
+    # ========================================================
+    # COMMON NAME FIELDS
+    # ========================================================
+
+    if field_normalized in {
+        "customer_name",
+        "client_name",
+        "buyer_name",
+        "purchaser_name"
+    }:
+
+        patterns = [
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:bought|purchased|ordered)",
+            r"(?:customer|client|buyer|purchaser)\s*[:\-]\s*([A-Za-z][A-Za-z .'-]+)"
+        ]
+
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                text
+            )
+
+            if match:
+
+                return convert_value(
+                    match.group(1).strip(),
+                    field_type
+                )
+
+
+    # ========================================================
+    # QUANTITY
+    # ========================================================
+
+    if field_normalized in {
+        "quantity",
+        "qty",
+        "count",
+        "number"
+    }:
+
+        match = re.search(
+            r"\b(\d+)\b\s+"
+            r"(?:items?|units?|pieces?|notebooks?|books?|"
+            r"products?|tickets?|copies?)",
+            text,
+            re.IGNORECASE
+        )
+
+
+        if match:
+
+            return int(
+                match.group(1)
+            )
+
+
+    # ========================================================
+    # PURCHASE DATE
+    # ========================================================
+
+    if field_normalized in {
+        "purchase_date",
+        "date",
+        "transaction_date",
+        "order_date"
+    }:
+
+        patterns = [
+
+            r"\b\d{1,2}\s+"
+            r"(?:January|February|March|April|May|June|July|"
+            r"August|September|October|November|December)"
+            r"\s+\d{4}\b",
+
+            r"\b\d{4}-\d{2}-\d{2}\b",
+
+            r"\b\d{1,2}/\d{1,2}/\d{4}\b"
+
+        ]
+
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
+
+
+            if match:
+
+                return convert_value(
+                    match.group(0),
+                    "date"
+                )
+
+
+    # ========================================================
+    # STORE
+    # ========================================================
+
+    if field_normalized in {
+        "store",
+        "shop",
+        "seller",
+        "merchant"
+    }:
+
+        patterns = [
+
+            r"\bfrom\s+([A-Z][A-Za-z0-9 .&'-]+?)(?:\.|$)",
+
+            r"\b(?:store|shop|merchant|seller)\s*[:\-]\s*"
+            r"([A-Za-z0-9 .&'-]+)"
+
+        ]
+
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                text
+            )
+
+
+            if match:
+
+                candidate = match.group(
+                    1
+                ).strip()
+
+
+                if candidate:
+
+                    return candidate
+
+
+    return None
+
+
+# ============================================================
+# MAIN EXTRACTION
+# ============================================================
+
+def dynamic_extract(
+    text: str,
+    schema: Dict[str, str]
+):
+
+    llm_data = extract_with_llm(
+        text,
+        schema
+    )
+
+
+    result = {}
+
+
+    for field, field_type in schema.items():
+
+        # ----------------------------------------------------
+        # First: use LLM result
+        # ----------------------------------------------------
+
+        value = llm_data.get(
+            field
+        )
+
+
+        converted = convert_value(
+            value,
+            field_type
+        )
+
+
+        # ----------------------------------------------------
+        # Second: deterministic fallback
+        #
+        # If LLM returned null, try direct extraction.
+        # ----------------------------------------------------
+
+        if converted is None:
+
+            fallback = deterministic_extract(
+                text,
+                field,
+                field_type
+            )
+
+
+            if fallback is not None:
+
+                converted = fallback
+
+
+        # ----------------------------------------------------
+        # Always include field
+        # ----------------------------------------------------
+
+        result[field] = converted
+
+
     return result
 
 
-@app.post("/dynamic-extract")
-async def dynamic_extract(payload: dict):
-    text = payload.get("text", "")
-    schema = payload.get("schema", {})
+# ============================================================
+# ENDPOINT
+# ============================================================
 
-    if not isinstance(schema, dict) or not schema:
-        return JSONResponse(status_code=400, content={"error": "schema must be a non-empty object"})
+@app.post(
+    "/dynamic-extract"
+)
+async def dynamic_extract_endpoint(
+    request: DynamicExtractRequest
+):
 
-    prompt = (
-        "Extract the following fields from the text below, matching the exact field "
-        "names and types given. Use null for any field that cannot be found or inferred. "
-        "For 'date' typed fields, always output ISO format YYYY-MM-DD. "
-        "For numeric fields, output plain numbers with no currency symbols or commas. "
-        "Return ONLY the requested fields, nothing extra.\n\n"
-        f"Fields and types: {json.dumps(schema)}\n\n"
-        f"Text:\n{text}"
-    )
+    text = request.text.strip()
 
-    response_schema = build_response_schema(schema)
 
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": response_schema,
-        },
-    }
+    if not text:
 
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
+        raise HTTPException(
+            status_code=400,
+            detail="text must not be empty"
+        )
+
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=body)
-            if resp.status_code != 200:
-                return validate_and_coerce(heuristic_fallback(text, schema), schema)
-            data = resp.json()
 
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return validate_and_coerce(heuristic_fallback(text, schema), schema)
-        parts = candidates[0].get("content", {}).get("parts", [])
-        raw_text = "".join(p.get("text", "") for p in parts)
-        parsed = json.loads(raw_text)
-        return validate_and_coerce(parsed, schema)
-    except Exception:
-        return validate_and_coerce(heuristic_fallback(text, schema), schema)
+        validate_schema(
+            request.schema
+        )
+
+    except ValueError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
 
 
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
+    try:
+
+        result = dynamic_extract(
+            text,
+            request.schema
+        )
+
+
+    except Exception as e:
+
+        print(
+            "Extraction error:",
+            repr(e)
+        )
+
+
+        # Even on extraction failure,
+        # return exact requested schema.
+
+        result = {
+            field: None
+            for field in request.schema
+        }
+
+
+    # --------------------------------------------------------
+    # FINAL STRICT SCHEMA ENFORCEMENT
+    # --------------------------------------------------------
+
+    final_result = {}
+
+
+    for field, field_type in request.schema.items():
+
+        value = result.get(
+            field
+        )
+
+
+        final_result[field] = convert_value(
+            value,
+            field_type
+        )
+
+
+    return final_result
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "status": "ok",
+        "service": "Dynamic Schema Structured Extraction API",
+        "endpoint": "/dynamic-extract"
+    }
